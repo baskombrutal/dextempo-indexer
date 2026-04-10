@@ -15,7 +15,10 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
-const client = createPublicClient({ transport: http(RPC_URL) });
+const client = createPublicClient({ 
+    transport: http(RPC_URL),
+    pollingInterval: 2000 // Ubah ke 2000 ms (2 detik)
+});
 
 const buyEvent = parseAbiItem('event TokensBought(address indexed token, address indexed buyer, uint256 amountInUsd, uint256 amountOutToken)');
 const sellEvent = parseAbiItem('event TokensSold(address indexed token, address indexed seller, uint256 amountInToken, uint256 amountOutUsd)');
