@@ -74,7 +74,7 @@ const routerReadAbi = [
   },
 ];
 
-// ---------- Factory read ABI (from your factory ABI) ----------
+// ---------- Factory read ABI ----------
 const factoryReadAbi = [
   {
     type: "function",
@@ -180,7 +180,8 @@ async function saveSwapToDatabase({
       block_number: blockNumber ? Number(blockNumber) : null,
       timestamp: timestampIso ?? new Date().toISOString(),
     },
-    { onConflict: "tx_hash" }
+    // ✅ FIX: harus match UNIQUE constraint di DB (tx_hash, chain_id)
+    { onConflict: "tx_hash,chain_id" }
   );
 
   if (error && error.code !== "23505") console.error("❌ Supabase swaps:", error.message);
@@ -308,7 +309,6 @@ async function watchDexFromRouterAndFactoryPolling() {
       address: pair,
       event: pairSwapEvent,
       onLogs: async (logs) => {
-        // 1 tx -> 1 row: pilih log swap terakhir per txHash
         const lastByTx = new Map();
         for (const l of logs) {
           const k = l.transactionHash.toLowerCase();
@@ -318,7 +318,6 @@ async function watchDexFromRouterAndFactoryPolling() {
 
         for (const log of lastByTx.values()) {
           try {
-            // Hanya swap yang lewat router (main dex)
             const sender = String(log.args.sender || "").toLowerCase();
             if (sender !== routerAddr.toLowerCase()) continue;
 
@@ -380,7 +379,6 @@ async function watchDexFromRouterAndFactoryPolling() {
     const n = Number(len);
     console.log("📦 Factory pairs:", n);
 
-    // watch semua pair (kalau banyak banget, kamu bisa batasi last N saja)
     for (let i = 0; i < n; i++) {
       const pair = await client.readContract({
         address: factoryAddr,
@@ -395,7 +393,6 @@ async function watchDexFromRouterAndFactoryPolling() {
 
   await seedPairsOnce();
 
-  // polling tiap 30 detik untuk pair baru (karena tidak pakai event PairCreated)
   setInterval(async () => {
     try {
       const len = await client.readContract({
@@ -405,8 +402,6 @@ async function watchDexFromRouterAndFactoryPolling() {
       });
       const n = Number(len);
 
-      // watch only new pairs
-      // kita cek dari belakang dan cari yang belum di-watch
       for (let i = Math.max(0, n - 50); i < n; i++) {
         const pair = await client.readContract({
           address: factoryAddr,
