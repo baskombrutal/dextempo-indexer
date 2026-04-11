@@ -22,6 +22,11 @@ const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SUPABASE_SERVICE_KEY =
   process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
 
+// how many recent blocks to backfill on startup
+const BACKFILL_BLOCKS = Number(process.env.BACKFILL_BLOCKS ?? 20000);
+// chunk size per getLogs call (avoid RPC limits)
+const BACKFILL_CHUNK = Number(process.env.BACKFILL_CHUNK ?? 2000);
+
 function reqEnv(name, val) {
   if (!val) {
     console.error(`❌ Missing env: ${name}`);
@@ -151,6 +156,7 @@ async function saveTradeToDatabase({
     created_at: createdAtIso ?? null,
   });
 
+  // only safe to ignore duplicates if you added UNIQUE index as recommended
   if (error && error.code !== "23505") console.error("❌ Supabase trades:", error.message);
   else if (!error) console.log(`✅ [${isBuy ? "BUY " : "SELL"}] ${token.slice(0, 6)}... $${usd.toFixed(2)}`);
 }
@@ -180,7 +186,6 @@ async function saveSwapToDatabase({
       block_number: blockNumber ? Number(blockNumber) : null,
       timestamp: timestampIso ?? new Date().toISOString(),
     },
-    // ✅ FIX: harus match UNIQUE constraint di DB (tx_hash, chain_id)
     { onConflict: "tx_hash,chain_id" }
   );
 
@@ -211,6 +216,91 @@ async function ensurePairMeta(pairAddress) {
   const meta = { token0: String(t0).toLowerCase(), token1: String(t1).toLowerCase() };
   pairMeta.set(p, meta);
   return meta;
+}
+
+// ---------- BACKFILL launchpad logs (so initial dev buy won't be missed) ----------
+async function backfillLaunchpad() {
+  const chainId = await client.getChainId();
+  const latest = await client.getBlockNumber();
+  const backfillBlocks = Number.isFinite(BACKFILL_BLOCKS) && BACKFILL_BLOCKS > 0 ? BACKFILL_BLOCKS : 0;
+
+  if (backfillBlocks <= 0) {
+    console.log("ℹ️ BACKFILL_BLOCKS=0, skip backfill");
+    return;
+  }
+
+  const from = latest > BigInt(backfillBlocks) ? latest - BigInt(backfillBlocks) : 0n;
+  const to = latest;
+
+  console.log(`⏮️ Backfill launchpad logs: fromBlock=${from} toBlock=${to} (range=${backfillBlocks})`);
+
+  for (let start = from; start <= to; start += BigInt(BACKFILL_CHUNK)) {
+    const end = start + BigInt(BACKFILL_CHUNK) - 1n <= to ? start + BigInt(BACKFILL_CHUNK) - 1n : to;
+
+    try {
+      const [buyLogs, sellLogs] = await Promise.all([
+        client.getLogs({ address: launchpadAddr, event: buyEvent, fromBlock: start, toBlock: end }),
+        client.getLogs({ address: launchpadAddr, event: sellEvent, fromBlock: start, toBlock: end }),
+      ]);
+
+      const all = [...buyLogs.map((l) => ({ kind: "BUY", l })), ...sellLogs.map((l) => ({ kind: "SELL", l }))];
+      // stable ordering
+      all.sort((a, b) => {
+        const ab = a.l.blockNumber ?? 0n;
+        const bb = b.l.blockNumber ?? 0n;
+        if (ab !== bb) return ab < bb ? -1 : 1;
+        const ai = a.l.logIndex ?? 0n;
+        const bi = b.l.logIndex ?? 0n;
+        return ai < bi ? -1 : ai > bi ? 1 : 0;
+      });
+
+      for (const it of all) {
+        const log = it.l;
+        const ts = await getBlockTimestamp(log.blockNumber);
+        const createdAtIso = ts ? new Date(ts * 1000).toISOString() : new Date().toISOString();
+
+        if (it.kind === "BUY") {
+          const usdAmt = Number(log.args.amountInUsd) / 1e6;
+          const tokenAmt = Number(log.args.amountOutToken) / 1e6;
+          const price = tokenAmt > 0 ? usdAmt / tokenAmt : 0;
+          await saveTradeToDatabase({
+            token: log.args.token,
+            isBuy: true,
+            usd: usdAmt,
+            tokenAmt,
+            price,
+            wallet: log.args.buyer,
+            hash: log.transactionHash,
+            logIndex: log.logIndex != null ? Number(log.logIndex) : null,
+            blockNumber: log.blockNumber,
+            chainId,
+            createdAtIso,
+          });
+        } else {
+          const usdAmt = Number(log.args.amountOutUsd) / 1e6;
+          const tokenAmt = Number(log.args.amountInToken) / 1e6;
+          const price = tokenAmt > 0 ? usdAmt / tokenAmt : 0;
+          await saveTradeToDatabase({
+            token: log.args.token,
+            isBuy: false,
+            usd: usdAmt,
+            tokenAmt,
+            price,
+            wallet: log.args.seller,
+            hash: log.transactionHash,
+            logIndex: log.logIndex != null ? Number(log.logIndex) : null,
+            blockNumber: log.blockNumber,
+            chainId,
+            createdAtIso,
+          });
+        }
+      }
+    } catch (e) {
+      console.error(`❌ Backfill chunk failed [${start}-${end}]`, e);
+    }
+  }
+
+  console.log("✅ Backfill done");
 }
 
 // ---------- watchers ----------
@@ -426,6 +516,8 @@ async function main() {
   console.log("🧭 Router:", routerAddr);
   console.log("=========================================");
 
+  // ✅ IMPORTANT: backfill first, then realtime watch
+  await backfillLaunchpad();
   await watchLaunchpad();
   await watchDexFromRouterAndFactoryPolling();
 }
