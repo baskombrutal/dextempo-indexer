@@ -97,6 +97,10 @@ const factoryReadAbi = [
   },
 ];
 
+const pairCreatedEvent = parseAbiItem(
+  "event PairCreated(address indexed token0, address indexed token1, address pair, uint256)"
+);
+
 // ---------- Pair ABI/events ----------
 const pairSwapEvent = parseAbiItem(
   "event Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)"
@@ -191,6 +195,33 @@ async function saveSwapToDatabase({
 
   if (error && error.code !== "23505") console.error("❌ Supabase swaps:", error.message);
   else if (!error) console.log(`✅ [SWAP] ${txHash.slice(0, 10)}... pair=${pairAddress.slice(0, 6)}...`);
+}
+
+async function savePairToDatabase({
+  pairAddress,
+  token0,
+  token1,
+  chainId,
+  blockNumber,
+  createdAtIso,
+}) {
+  const { error } = await supabase.from("pairs").upsert(
+    {
+      pair_address: pairAddress.toLowerCase(),
+      token0: token0.toLowerCase(),
+      token1: token1.toLowerCase(),
+      chain_id: chainId ?? null,
+      block_number: blockNumber != null ? Number(blockNumber) : null,
+      created_at: createdAtIso ?? new Date().toISOString(),
+    },
+    { onConflict: "pair_address,chain_id" }
+  );
+
+  if (error && error.code !== "23505") {
+    console.error("❌ Supabase pairs:", error.message);
+  } else if (!error) {
+    console.log(`✅ [PAIR] ${pairAddress.slice(0, 10)}... ${token0.slice(0, 6)}/${token1.slice(0, 6)}`);
+  }
 }
 
 // pairAddress(lower)->{token0,token1}
@@ -387,13 +418,21 @@ async function watchDexFromRouterAndFactoryPolling() {
 
   const watchedPairs = new Set();
 
-  async function watchPair(pairAddress) {
+  async function watchPair(pairAddress, blockNumber = null, createdAtIso = null) {
     const pair = getAddress(pairAddress);
     const key = pair.toLowerCase();
     if (watchedPairs.has(key)) return;
     watchedPairs.add(key);
 
-    await ensurePairMeta(pair);
+    const meta = await ensurePairMeta(pair);
+    await savePairToDatabase({
+      pairAddress: pair,
+      token0: meta.token0,
+      token1: meta.token1,
+      chainId,
+      blockNumber,
+      createdAtIso,
+    });
 
     client.watchEvent({
       address: pair,
@@ -459,6 +498,35 @@ async function watchDexFromRouterAndFactoryPolling() {
 
     console.log("👀 Watching pair:", pair);
   }
+
+  client.watchEvent({
+    address: factoryAddr,
+    event: pairCreatedEvent,
+    onLogs: async (logs) => {
+      for (const log of logs) {
+        try {
+          const pairAddress = String(log.args.pair);
+          if (!isAddress(pairAddress)) continue;
+
+          const ts = await getBlockTimestamp(log.blockNumber);
+          const createdAtIso = ts ? new Date(ts * 1000).toISOString() : new Date().toISOString();
+
+          await savePairToDatabase({
+            pairAddress,
+            token0: String(log.args.token0),
+            token1: String(log.args.token1),
+            chainId,
+            blockNumber: log.blockNumber,
+            createdAtIso,
+          });
+
+          await watchPair(pairAddress, log.blockNumber, createdAtIso);
+        } catch (e) {
+          console.error("❌ pairCreated failed:", e);
+        }
+      }
+    },
+  });
 
   async function seedPairsOnce() {
     const len = await client.readContract({
